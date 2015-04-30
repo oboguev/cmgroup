@@ -1,0 +1,186 @@
+                    CONCURRENCY MANAGENEMENT GROUPS.
+                         POSSIBLE FUTURE WORK.
+
+Notes below are raw brainstorming material and are not intended for immediate 
+implementation.
+
+
+MULTIPLE AND INTER-PROCESS ASSOCIATIONS
+=======================================
+
+As currently defined, the proposed concurrency group mechanism associates a 
+concurrency group with only one AIO context or epoll fd. It might be possible 
+to extend it in the future to let multiple epoll fd's and AIO contexts be 
+associated with the same concurrency group. 
+
+
+    +--------+               +-------------+               +-------------+
+    |        | ==(0 or 1)==> |             | ==(0 or N)==> |             | 
+    | thread |               | concurrency |               | AIO context |
+    |        |               |    group    |               | or epoll fd |
+    |        | <==(0 to N)== |             | <==(0 or 1)== |             |
+    +--------+               +-------------+               +-------------+
+
+
+This could be potentially useful in two ways: intra-application and 
+inter-application (or inter-process within an application consisting of 
+multiple executable images).
+
+Intra-application wise, a process may want to segregate event sources into 
+different categories and keep a separate epoll fd or AIO context for each 
+category, for the reasons of the application's internal logic (at a very 
+minimum, an application may want to process events from one AIO context and one 
+epoll fd), all the while limiting the number of concurrently runnable threads 
+used for the whole processing.
+
+Inter-application wise (or inter-process wise) it may be desirable to expand 
+the limiting mechanism to control the number of concurrently runnable threads 
+in a set of processes. For example, a database engine may consist of several 
+processes and wish to limit the number of concurrently runnable worker threads 
+in all of these processes, even though they do not share the same AIO context 
+or epoll object for their event (request) sources. This can perhaps be taken a 
+step further in an attempt to limit concurrency even across a set of 
+applications: for example, a machine may have web server and database engine 
+running on it, and worker threads inside both applications could be subject to 
+a shared concurrency-limiting mechanism. This, however, may not always be good 
+and desirable, since it will cause interference between the two applications, 
+and to work well may require thinking through the consequences of this 
+interference and advance design for cooperation.
+
+Nevertheless, if such capability were to be provided, it may look approximately 
+the following way. In addition to the cmgroup_newgroup() system call, an 
+extended form may be implemented:
+
+    int cmg_fd = cmgroup_newgroup_ex(const char* path, int umode, int nthreads, int flags);
+
+that will create a named concurrency group. Any application with proper access 
+rights, as controlled by "umode", can access this concurrency group with 
+cmgroup_newgroup_ex(). In addition to CMGROUP_CLOEXEC, "flags" include 
+CMGROUP_CREATE, CMGROUP_PERSISTENT and CMGROUP_FROZEN. 
+
+CMGROUP_CREATE causes the system call to fail if the named group already exist, 
+otherwise if this flag is not specified and the group already exist, the call 
+opens the existing group without modifying its previously set concurrency value 
+(i.e. parameter "nthreads" is ignored). 
+
+CMGROUP_PERSISTENT makes the group persistent, i.e. preserved after the calling 
+process is terminated until the system is restarted. Use of CMGROUP_PERSISTENT 
+may require administrative privileges.
+
+CMGROUP_FROZEN disables further changes to cmgroup's concurrency limit with 
+cmgroup_set_concurrency().
+
+A system call may also be provided to destroy the persistent group. The group 
+object is actually destroyed once the last reference to it is gone, but the 
+group may disappear from namespace immediately after the destruction call is 
+issued, i.e. subsequent cmgroup_newgroup_ex() will result in the creation of 
+another group with the same name.
+
+A command-line utility may be provided to create persistent concurrency groups 
+with desired characteristics. A system administrator may use such utility to 
+create groups for shared use by multiple applications, and once a group with a 
+specific name is created and configured to the desired number of runnable 
+threads (according to the expected system workload and application mix, but 
+perhaps most often simply defaulted to the number of CPUs in the system), 
+applications may be started and use this group. The name of the concurrency 
+group to be used by the application for its worker threads may be specified in 
+an application's configuration file.
+
+If multiple AIO contexts and/or epoll fd 's are associated with a concurrency 
+group, an obvious problem to address is how to decide exactly which of the 
+threads blocked in them is to be unblocked when the count of runnable threads 
+in the group drops below the concurrency value (e.g. in case if a running 
+threads enters wait state). One possible approach is for the concurrency group 
+object to contain a list of all associated AIO contexts and/or epoll fd 's that 
+have threads blocking on them due to concurrency control by the concurrency 
+group. When the count of runnable threads in the group drops below the 
+concurrency value, an entry from that list may be picked up on a round-robin or 
+random basis. This won't take into account possible difference in priority 
+between threads waiting on enlisted AIO contexts and/or epoll fd 's, and thus 
+unblocked thread may not be the one with the highest priority (just as it is 
+with regular io_getevents, epoll_wait and epoll_pwait system calls), but 
+perhaps this may be acceptable as a part of the requirement that the mechanism 
+should be among applications designed for cooperation. Alternatively, each list 
+entry may keep the priority of the highest-priority thread blocked on AIO 
+contexts and/or epoll fd object, and the entry with the highest priority is 
+selected. Among entries with identical priority, the choice can be made in 
+round-robin fashion, at random, or in order of entering the entry on the list. 
+The purpose to mind would be to avoid starvation of one application by another.
+
+
+STREAMED RESPONSES
+==================
+
+Some applications that process requests send a response required to be 
+delivered as a whole before it can be processed by the requestor, whereas 
+others respond with a stream processed by the receiver as it comes in. For 
+example, streamed response can be viewed interactively by a human. 
+
+In the latter category of cases it may be desirable for an application to be 
+able to balance interactive responsiveness vs. total throughput. Even though 
+sticking to using a minimal number of threads maximizes total throughput, it 
+can make the server output look choppy (rather than smooth), and a long delay 
+in initial response while the request message is pending in the server input 
+queue may be irritating to a human on the receiving end. It may therefore be 
+sometimes desirable to use a larger number of worker threads than the number of 
+CPUs in the system: even though this would reduce numerically measured 
+throughput of the system, but will result in overall better perception of the 
+response.
+
+Within the context of the concurrency management group mechanism this would 
+call for a capability to dynamically adjust a group's concurrency level 
+depending on factors like the length of the queue (backlog size) and average or 
+maximum event wait time in the event queue before an event is fetched for 
+processing.
+
+It should ultimately be up to an application to establish a policy of 
+dynamically expanding or shrinking cmgroup concurrency level based on the 
+aforementioned factors (or overriding the cmgroup constraint for events that 
+had been pending in the input queue longer than specified time).
+
+However the kernel should provide an adequate mechanism to implement an 
+application's policy, including the collection of required event queue data and 
+exposure of it to a policy module. A policy module itself might be implemented 
+as a thread in user space, or as a kernel-resident component. The latter might 
+perhaps be implemented as an expandable library of common policies, with one of 
+the policy modules possibly also taking a compiled formula loadable from the 
+userspace, similar to DTrace.
+
+It might also be possible to implement a policy completely in userspace, by 
+using two event queues: a primary event queue from which the events are pumped 
+by userland thread and then redispatched via a secondary event queue, and thus 
+the event queue can be known to userspace code and tracked by it. However that 
+would add a cost of extra thread-to-thread and userspace-kernel context 
+switches.
+
+
+VOLUNTARY YIELDING
+==================
+
+Cmgroup facility does not impose a hard limit on the application concurrency, 
+it imposes only a soft limit maintained at a low overhead. It is possible for 
+the number of runnable threads in a cmgroup to occasionally exceed the 
+concurrency limit, however typically the limit is exceeded only by a small 
+amount and for a very short time.
+
+In certain extreme scenarios it is nevertheless possible for the limit to be 
+exceeded substantially. Consider for instance a scenario where a large number 
+of active worker threads processing requests block in the middle of the handler 
+waiting for some event, and once this event happens, herd-like wakeup occurs. 
+In this case concurrency limit can be exceeded substantially.
+
+If possibility of this or similar scenarios is felt to be an issue, it is 
+possible to introduce an additional primitive mitigating the described issue:
+
+    int cmgroup_yield(int timeout, const sigset_t *sigmask);
+
+When cmgroup_yield() is called by a thread associated with cmgroup, and 
+concurrency limit for the group is overdrawn (the number of currently runnable 
+threads in the cmgroup exceeds the cmgroup's concurrency limit), the thread 
+will enter a wait state and stay blocked until the number of runnable threads 
+in cmgroup drops below the concurrency limit, or optional timeout expires, or 
+the thread receives a signal not blocked by optional sigmask. Threads blocked 
+from execution due to cmgroup_yield() have scheduling precedence over threads 
+waiting for events in event-fetching syscalls: when a runnable opening in the 
+cmgroup occurs, threads waiting in cmgroup_yield() will get unblocked and 
+consume the opening before the threads blocked in event-fetching syscalls.

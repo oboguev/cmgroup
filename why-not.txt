@@ -1,0 +1,57 @@
+Cmgroup is mostly useful only for short and cache-intensive event handlers,
+where cache warm-up factors matter.
+
+For cache warm-up to matter, the handlers must have a duration in sub-millisecond
+range. However for handlers this short usleep() and other blocking primitives
+cause an uneven distribution of tasks across the CPUs, leaving some CPUs with
+zero tasks, while other with multiple tasks in the queue, for example:
+
+     1  0  2  0  3  1  4
+
+resulting in some CPUs underused, while other CPUs are overloaded.
+
+In practical benchmark runs with short handlers, observed idle time is around
+20-30% due to the CPUs with no tasks in per-CPU runqueue. While at the same time
+on the overloaded CPUs there are multiple tasks pending in the runqueue.
+
+Tasks will get rebalanced across the CPUs, but only after some time, which is ok
+for longer running jobs, but not for short-running handlers.
+
+Cmgroup utility is thus defeated.
+ 
+Solution to this would require either 
+
+1) Several "standby" threads per CPU, which is wasteful, esp. think of 1024-CPU
+   system and cmgroup with CV=20. Cannot provide satisfactory generic solution
+   this way.
+   
+2) Forced migration of task to CPU where cmgroup task was dequeued from the
+   runqueue. Can use cmgroup_waitqueue_t (see below). "Forced" means local CPU
+   is preferred, not "ensured".
+   
+****************
+
+Also: large negative count of "available", to -10 or -13 on 24-CPU machine
+when either AIO or EPOLL is used. It looks either like using cmpxhchg for
+available checks is too lazy/slow, or usleep overshoots and needs cmgroup_yield.
+
+The former would require locked (rather than lockless) checks of "available".
+
+The latter would require cmgroup_yield, and also changing "database client
+libraries" etc. code.
+
+****************
+
+cmgroup_waitqueue_t:
+
+three listheads: 
+  - per CPU
+  - per cache domain (cpus_share_cache)
+  - all
+
+****************
+
+Conclusion: IOCP was helpful in mid-90s, on OS architectures with global runqueue,
+but after transitioning to per-CPU runqueues IO completion ports are no longer
+useful.
+

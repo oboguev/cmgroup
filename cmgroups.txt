@@ -1,0 +1,659 @@
+
+                       CONCURRENCY MANAGENEMENT GROUPS
+
+
+The concurrency management extension proposed below for Linux AIO and epoll 
+facilities is intended to improve the efficiency of a certain category of 
+multithreaded applications relying on AIO or epoll event processing.
+
+The proposed extension offers a method to control the concurrency level in 
+applications with the intention to maintain close to optimal number of 
+simultaneously runnable threads [*] and thus to avoid losses caused by too
+high a number of concurrent threads.
+
+    [*] Similar to the method employed by Microsoft Windows IO completion
+        ports. Another inspiration for the idea is the design of Nginx web 
+        server.
+    
+    By runnable thread we hereafter understand a thread that is currently 
+    executing on a processor or is pending in the scheduler's run queue ready
+    to execute as soon as a processor is available. Threads that are blocked
+    waiting for events or in suspended state (e.g. due to SIGSTOP) are not 
+    runnable.
+
+The kinds of applications that can benefit from the proposed extension are 
+discussed in the section "Who can benefit?" below. Briefly, two categories of 
+applications that are built around a model of event pump receiving AIO or epoll 
+events dispatched afterwards to event (request) handlers for processing can 
+benefit by using the proposed concurrency management facility:
+
+a) Applications with event or request handlers placing high demand during 
+request processing on limited shared resources such as main memory or cache 
+memory, or with worker threads causing high contention on locks for data shared 
+between the worker threads. Limiting the number of concurrently runnable 
+threads (e.g. to the number of CPUs in the system or other desirable target 
+value) may help with better allocation of limited resource or reducing data 
+locks contention.
+
+b) Applications with very short event handlers, with execution time typically 
+in the sub-millisecond range. Limiting the number of concurrently runnable 
+threads and giving the precedence for event fetching to the latest thread that 
+invoked an event-fetching syscall (i.e. keeping internal wait queue in LIFO 
+order) helps to reduce the frequency of context switches, scheduling overhead, 
+TLB flushing and cache thrashing. However the impact of those sources of 
+inefficiency, apart from cache thrashing, is quite small, therefore the losses 
+that the use of concurrency management would help to recover in scenario (b) 
+are only a fraction of the percent of the handler's run time. By the way of 
+comparison, recoverable losses due to cache thrashing in cache-intensive 
+application can be on the order of few percent, and losses due to high paging 
+rate or high locking and spin-waiting rate on a contented lock can be 
+significant as well.
+
+Furthermore, for an application falling into any of these patterns to be able 
+to benefit from the proposed concurrency management facility, application's 
+request handlers must have a need to enter sometimes wait state due to causes 
+such as making synchronous network or IO request, database request, waiting on 
+a lock, page fault or other similar reason, with somewhat unpredictable 
+duration or likelihood.
+
+If application has purely asynchronous design and its worker threads never 
+block in request handlers, proposed facility won't be useful for such an 
+application, since the desired number of runnable threads can be configured 
+statically. Likewise, if it is possible to predict in advance the duration and 
+likelihood of blocking, proposed facility won't be very useful either, since in 
+this case it may also be possible to statically fix in advance the number of 
+worker threads within the conventional epoll or AIO event dispatch scheme with 
+satisfactory results. However making application fully asynchronous or blocking 
+likelihood and duration predictable is often impossible.
+
+
+RATIONALE
+=========
+
+Many concurrent applications, especially server applications, are designed 
+around an event handling model, such as processing of AIO completion events or 
+epoll events dispatched to event handlers. 
+
+A naive approach to event/request handling may try to process large number of 
+events in parallel by utilizing a large pool of worker threads. This approach 
+however would be inefficient, for the following reasons.
+
+(1) Since in many real-life cases worker threads utilize shared resources, a 
+large number of concurrently runnable worker threads would induce excessive 
+resource contention with resulting losses due to the costs of synchronization 
+on shared resources. Furthermore, if a resource is limited, high contention for 
+it may result in suboptimal resource allocation for each of the requesting 
+threads (such as smaller buffer space, resulting in processing in smaller 
+chunks, rather than more streamlined bulk processing, or cache thrashing, TLB 
+thrashing, higher virtual memory pressure and paging rate and so on).
+
+(2) Too large a number of concurrently runnable threads would induce excessive 
+overhead due to high incidence of involuntary context switches at scheduling 
+quantum expiration, resulting in losses due to scheduling overhead, cost of 
+thread or process context switches and excessive TLB flushing.
+
+(3) On NUMA machines, smaller number of threads close to the number of CPUs 
+makes it easier on the scheduler to keep tasks allocated to CPUs matching the 
+task's data NUMA memory zone, and also reduces the overhead for task migration.
+
+Therefore a more optimal policy of trying to minimize losses due to the 
+previously mentioned sources of overhead would try to keep the number of 
+runnable processing threads close to the number of CPUs in the system -- making 
+sure that the number of runnable worker threads does not fall below the number 
+of CPUs, but also does not exceed it greatly and stays at or only just slightly 
+above the number of CPUs.
+
+Such a policy requires support from the kernel to implement it.
+
+Indeed, without kernel support a naive userland-only implementation might have 
+tried to utilize a thread pool with the number of worker threads equal to the 
+number of CPUs in the system or just above it. However most real-life event 
+handlers do not stay computable for the entire duration of event processing, 
+but rather block now and then in the course of their execution. Blocking may 
+occur while waiting on a synchronous IO or network operation, access to a 
+shared resource, other synchronization events, or a page fault. Blocking waits 
+may be caused either directly by a handler's own code or by the libraries it 
+relies on; for example most database client libraries do not offer an 
+asynchronous invocation mode. It is often impossible to predict in advance the 
+percentage of the time the handler will spend in a wait state; for example, 
+waits experienced by threads in middle-tier server may well vary widely 
+depending on the load of backend database or application server. Therefore 
+naively limiting the size of the worker thread pool to the number of CPUs in 
+the system (or any fixed number somewhat above it) would often end off the 
+mark, sometimes resulting in threads spending a larger fraction of their time 
+in wait state than was expected, resulting in CPU resources being 
+underutilized, and sometimes on the contrary resulting in excessive number of 
+runnable worker threads, leading to losses due to reasons discussed earlier.
+
+Another naive approach may try to utilize a large number of worker threads 
+aggregated in a specially designated scheduling group, and instruct the 
+scheduler to limit the number of threads in this group that may be considered 
+runnable at the same time: once the number of running threads from this group 
+reaches the number of CPUs in the system, the scheduler won't consider any 
+remaining threads in the group for scheduling. This approach however poses a 
+whole range of issues. For example, a thread holding a resource lock may end up 
+being prevented from execution by being considered out of the imposed limit. 
+Also, implementation of the described approach would require intrusive 
+modifications to the existing schedulers and scheduling structures, and such 
+modifications would furthermore need to be designed carefully to avoid 
+detrimental effects of having a large number of runnable threads described in 
+the beginning of this section. For example recently-run threads must be given 
+precedence over longer-waiting threads; coupled with affinity considerations, 
+this would make scheduling complicated and potentially more costly.
+
+
+SOLUTION
+========
+
+A more practical and straightforward approach to concurrency level control is 
+to limit dequeuing of AIO and epoll events by the application (either single 
+process or cooperating set of processes) such that the total number of active 
+threads does not exceed target concurrency level by much. If the designated 
+number of an application's worker threads are runnable and occupy CPUs in the 
+system with processing previously fetched events, the kernel won't release new 
+pending AIO or epoll events to the application, and worker threads waiting for 
+those events will remain blocked. They will get unblocked and receive the next 
+pending event only when one of the application's threads ceases to be runnable, 
+either because it completed handling an event it had been processing, or the 
+handler entered a blocking wait state.
+
+Concurrency level, i.e. desired limit on the number of runnable threads, is set 
+by the application developer and, depending on the application's nature and its 
+deployment, can be set (for example) to be equal to the number of CPUs in the 
+system or to another value (see discussion below in the section "concurrency 
+value").
+
+If the current count of an application's runnable worker threads is at or above 
+the set target level, threads waiting for event-fetching syscalls 
+(io_getevents, epoll_wait, epoll_pwait) remain blocked and pending events 
+remain in the processing queue. Once one or more of the worker threads enter 
+wait state, and the total number of runnable worker threads drops below the 
+limit, events become available for fetching and one or more threads waiting in 
+epoll_wait, epoll_pwait or io_getevents get unblocked.
+
+An API for the proposed mechanism is implemented as a number of additional 
+syscalls interoperating with existing epoll and AIO facilities. The introduced 
+APIs allow an application to tune the behavior of those facilities, 
+specifically the behavior of epoll_wait, epoll_pwait and io_getevents. Note 
+that the existing syscall signatures are not modified and added calls are 
+strictly an extension: if new syscalls are not invoked by the application, the 
+behavior of existing syscalls remains unchanged for the application. In order 
+to enable new behavior, an application has to invoke the extension syscalls 
+which will slightly modify the behavior of the existing syscalls, but only for 
+explicitly identified objects (particular epoll fd's or AIO contexts). Since 
+the signatures and prevailing functionality and purpose of existing syscalls 
+remain unchanged, new behavior can be accommodated by existing applications 
+with minimum disturbance to the existing code; in fact it may be possible to 
+tune the behavior of existing components, such as libraries, without modifying 
+them at all, as long as they expose epoll fd's and AIO context handles to the 
+caller.
+
+The proposed API introduces a new entity: concurrency management group 
+(cmgroup), also for brevity hereafter called concurrency group. The most 
+important attribute of this entity is the concurrency level, i.e. maximum 
+number of threads associated with the group an application wants to see 
+runnable at any given time. A dynamic property of a concurrency management 
+group is the actual number of threads in the group currently in runnable state 
+(whether running or pending in the scheduler run queue). As is explained 
+further, concurrency level does not impose a hard scheduling limit, and the 
+actual number of currently runnable threads within the concurrency management 
+group may at times exceed the target concurrency level, but in practice will 
+remain close to it, and once exceeded the limit, will tend to drop back to it 
+soon.
+
+Any thread in the system can at any given time be associated with at most one 
+concurrency group, or it may be associated with none. Thread-to-concurrency 
+group association can change over time. At creation time a thread is not 
+associated with any concurrency group, however it may get associated with a 
+certain concurrency group in one of the ways described below, then change its 
+association to another concurrency group, then drop any association.
+
+Each epoll fd and AIO context can optionally be associated with at most one 
+concurrency group, or it may be associated with none. This association is 
+explicitly defined by the application. Unless the application explicitly 
+defines an association for a given epoll fd or AIO context object, this object 
+is not associated with any concurrency group and epoll_wait, epoll_pwait or 
+io_getevents syscalls on that object behave in a traditional way and impose no 
+constraint on the dequeuing of the events due to runnable thread count. Once 
+the association of epoll fd or AIO context object with given concurrency group 
+is established, the association cannot be altered or broken, and remains 
+permanent until the object's destruction.  In the initial version of the 
+proposed API, there is only 1:1 or 1:0 association between any epoll fd or AIO 
+context and a concurrency group, and vice versa, only 1:1 or 1:0 association 
+between a concurrency group and epoll fd or AIO context.
+
+
+    +--------+               +-------------+               +-------------+
+    |        | ==(0 or 1)==> |             | ==(0 or 1)==> |             | 
+    | thread |               | concurrency |               | AIO context |
+    |        |               |    group    |               | or epoll fd |
+    |        | <==(0 to N)== |             | <==(0 or 1)== |             |
+    +--------+               +-------------+               +-------------+
+
+
+However in the future versions of cmgroup API it might be possible for multiple 
+epoll fd's and AIO contexts to be associated with the same concurrency group 
+(see document "Possible future work").
+
+Concurrency management group is created with the following system call:
+
+    int cmg_fd = cmgroup_newgroup(int nthreads, unsigned int flags);
+
+"nthreads" specifies the desired concurrency level for the concurrency group. 
+If specified as 0, concurrency level is defaulted to the current number of 
+active CPUs in the system [*]. cmgroup_newgroup() returns the file descriptor 
+for the created concurrency group object. If the call fails, returned value is 
+-1, in which case errno is set appropriately.
+
+    [*] The number of CPUs is taken at the time of group creation. If the 
+        application wants to automatically adjust to CPUs going online or 
+        offline, it can monitor such transitions (e.g. by polling /proc/cpuinfo 
+        or /sys/devices/system/cpu) and change the group's concurrency value
+        with cmgroup_set_concurrency_level. In the simplest form, periodically 
+        calling cmgroup_set_concurency_level(cmg_fd, 0) will keep cmgroup's 
+        concurrency value equal to the current number of CPUs.
+
+The parameter "flags" may include CMGROUP_CLOEXEC designating that the returned 
+file handle is to be automatically closed on execve(…) system call. However the 
+actual concurrency group object is destroyed only after all references to it 
+are gone, including file descriptor references and also references inside the 
+kernel, including associations to cmgroup from threads, AIO contexts and epoll 
+fd's.
+
+After a cmgroup is created, its concurrency level can be dynamically adjusted 
+with the system call
+
+    int status = cmgroup_set_concurency_level(int cmg_fd, int nthreads);
+
+"nthreads" specifies the desired concurrency level for the concurrency group. 
+If left to 0, concurrency level is defaulted to the current number of active 
+CPUs in the system. If successful, cmgroup_set_concurency_level () returns 
+zero. When an error occurs, cmgroup_set_concurency_level() returns -1 and errno 
+is set appropriately.
+
+Another system call allows to query group 's concurrency value:
+
+    int nthreads = cmgroup_get_concurrency_level(int cmg_fd);
+
+If successful, cmgroup_get_concurrency_level() will return concurrency value in
+effect. This is the value set by the latest cmgroup_newgroup() or 
+cmgroup_set_concurency_level() call, or if 0 was passed as the concurrency 
+value to the latest of those calls, then the number of active CPUs in the 
+system at the time of that call. When an error occurs, 
+cmgroup_get_concurency_level () returns -1 and errno is set appropriately.
+
+To associate epoll file descriptor (epfd) with a created concurrency group 
+(cmg_fd), use the following system call:
+
+    int status = epoll_ctl(int epfd, EPOLL_CTL_SET_CMGROUP, int cmg_fd, NULL);
+
+If successful, epoll_ctl() returns zero. When an error occurs, epoll_ctl() 
+returns -1 and errno is set appropriately. If epfd is already associated with 
+another cmgroup, epoll_ctl() will return -1 with errno set to EBUSY.
+Once epfd is associated with cmg_fd, the association is maintained until the 
+destruction of epfd.
+
+To associate an AIO context with the concurrency management group, use the 
+following system call:
+
+    int status = io_set_cmgroup(aio_context_t ctx_id, int cmg_fd);
+
+If successful, io_set_cmgroup () returns zero. When an error occurs, 
+io_set_cmgroup () returns -1 and errno is set appropriately. If ctx_id is 
+already associated with another cmgroup, io_set_cmgroup() will return -1 with 
+errno set to EBUSY.
+
+Once ctx_id is associated with cmg_fd, the association is maintained until the 
+destruction of ctx_id.
+
+If the AIO context or epoll fd is not associated with any concurrency group, 
+system calls io_getevents, epoll_wait and epoll_pwait execute according to 
+their traditional behavior imposing no limitations on the number of runnable 
+threads and do not prevent a dequeuing of the event(s), even if the calling 
+thread itself is associated with a concurrency group.
+
+If the AIO context or epoll fd is associated with a concurrency group, then a 
+thread performing io_getevents, epoll_wait and epoll_pwait on this AIO context 
+or poll fd will automatically get associated with the same concurrency group. 
+If the thread at the time of the call was associated with another concurrency 
+group, it will get dissociated from that group first (with the same 
+consequences as described below for cmgroup_dissociate) and then will be 
+associated to a new group. Pending AIO or epoll messages will get dequeued and 
+passed to the thread only if the number of runnable threads associated with the 
+group (including current thread) does not exceed the concurrency limit set for 
+the concurrency group. Otherwise the calling thread will remain blocked in 
+io_getevents, epoll_wait and epoll_pwait until the number of runnable threads 
+in the group drops below concurrency limit, at which point one or more threads 
+may get unblocked and be able to fetch messages, or until the wait timeout 
+specified in the call expires. On return from the system call, the thread 
+remains associated with corresponding concurrency group.
+
+When AIO context or epoll object is being associated with cmgroup by 
+io_set_cmgroup() or epoll_ctl(EPOLL_CTL_SET_CMGROUP), all threads currently 
+blocked inside an event-fetching syscall on this AIO context or epoll object 
+will get associated with the same cmgroup too, as long as a thread was indeed 
+blocked in the event-fetching syscall and was not already exiting the syscall. 
+This allows for an application to reuse existing components that pre-create a 
+thread pool bound to an AIO context or epoll dispatch object, and for the 
+application to associate this whole composite event dispatch construct (AIO or 
+epoll object plus all the pool's threads) with cmgroup in a single call, 
+without modifying the existing component's code, as long as the dispatch 
+construct is "idle" and not receiving the events yet. Those threads that were 
+already exiting or have exited the event-fetching syscall at the time the AIO 
+or epoll object was being associated with the cmgroup would not get associated 
+with the cmgroup and will not be counted against the cmgroup concurrency value 
+for the current pass, however these threads will get associated too with the 
+cmgroup on their next pass, i.e. their next request to an event-fetching 
+syscall on the dispatch AIO or epoll object.
+
+A thread can also be explicitly associated with a concurrency group with the 
+following system call:
+
+    int status = cmgroup_associate(int cmg_fd);
+
+If successful, cmgroup_associate () returns zero. When an error occurs, 
+cmgroup_associate () returns -1 and errno is set appropriately. If the calling 
+thread had been previously associated with the same concurrency group, the 
+operation is a no-op. If the thread had previously been associated with another 
+concurrency group, on successful return it will first get dissociated from that 
+group (with the same consequences as described below for cmgroup_dissociate) 
+and then associated with the new group. After the thread has been associated 
+with the new concurrency group, the number of runnable threads in that group is 
+increased by 1.
+
+A thread can be explicitly dissociated from its current concurrency management 
+group with the following system call:
+
+    int status = cmgroup_dissociate(int cmg_fd);
+
+If the thread had previously been associated with a concurrency group, on 
+successful return from cmgroup_dissociate() it will get dissociated from that 
+group resulting in the number of runnable threads in that group dropping by one 
+and possibly releasing another thread in the group waiting inside io_getevents, 
+epoll_wait or epoll_pwait syscalls (similar to what happens if dissociation is 
+performed by those syscalls or by cmgroup_associate if they alter 
+thread-to-cmgroup association).
+
+If successful, cmgroup_dissociate () returns zero, which will almost always be 
+the case, even if the calling thread had not been associated with any 
+concurrency group. When an error occurs, cmgroup_dissociate() returns -1 and 
+errno is set appropriately. 
+
+When a thread associated with a concurrency management group enters wait state 
+because of blocking inside a system call or because of SIGSTOP or SIGTSTP or 
+because of page fault leading to IO or other conditions causing wait, the 
+kernel decrements the counter of runnable threads in the concurrency group 
+object. If that counter drops below the concurrency value attribute of the 
+group, the kernel will check if there is a thread blocked inside io_getevents, 
+epoll_wait or epoll_pwait syscalls for AIO context or epoll fd object 
+associated with the concurrency group, and if so, will allow this thread to 
+fetch an event or events it had been asking for.
+
+Once a thread that had previously been in a wait state leaves that wait state 
+and becomes runnable again, the kernel will increment the counter of runnable 
+threads in the corresponding concurrency group object.
+
+Note that this may cause the number of runnable threads in the concurrency 
+group to briefly exceed the concurrency value. Consider the following scenario: 
+concurrency management group CMG has concurrency value CV and there are 
+currently CV runnable threads in the group. Thread TA is blocked inside 
+io_getevents for AIO context associated with CMG that has pending AIO 
+completion events that TA may fetch, however TA is not allowed to fetch them 
+because that would result in the number of runnable threads in CMG to exceed 
+CV, so TA stays blocked in io_getevents. Thread TB that had been running makes 
+a system call (such as wait on a futex) that results in TB entering wait state 
+and the count of runnable threads in CMG dropping to (CV - 1). At this point TA 
+will get unblocked, fetch event or events it had been interested in, and become 
+runnable. The counter of runnable threads for CMG will get incremented and 
+become CV again. While TA is still executing, TB completes its wait state (e.g. 
+successfully acquires a futex) and becomes runnable. The counter of runnable 
+threads in CMG is incremented again and becomes CV+1.
+
+Thus it is possible for the number of runnable threads in a concurrency group 
+to sometimes exceed its concurrency value, however such overshooting will 
+typically be small and after the overshoot the number of runnable worker 
+threads will tend to drop back to concurrency value. Thus even though the 
+proposed scheme does not ensure a hard limit on the number of runnable threads, 
+it still implements an effective control to serve the purpose of the mechanism 
+-- namely, keep losses due to the causes described in the beginning of the 
+article low or very low.
+
+The purpose of the concurrency management group mechanism is not to enforce a 
+hard limit on the number of runnable threads in a group, but to impose a soft 
+limit at a low cost of added concurrency control.
+
+When a new thread is created, it is not initially associated with any 
+concurrency group, and also association with a concurrency group is not 
+inherited from a parent thread.
+
+Whenever a thread associated with a concurrency management group executes an 
+event-fetching syscall (io_getevents, epoll_wait or epoll_pwait) on an AIO 
+context or epoll fd not associated with any cmgroup, the thread retains the 
+original association and the call imposes no concurrency control.
+
+When a thread calls io_getevents, epoll_wait or epoll_pwait for an AIO context 
+or epoll fd associated with a concurrency group, the calling thread wherever 
+possible will have a precedence for fetching pending or incoming events over 
+the threads that had been previously waiting on the event queues for this AIO 
+context or epoll object. [*] This reduces the number of context switches and 
+TLB flushes and maximizes cache use for per-thread data (such as per-thread 
+application-specific context, user-mode and kernel-mode stacks, kernel data 
+associated with the thread, such as task_struct, network structures for the 
+thread's possible connection to the backend server and so on); this also 
+facilitates tasks maintaining better affinity to CPUs and reduces cross-CPU 
+migration for the tasks. In the streamlined case when a system operates at the 
+limit established by the concurrency value, a thread calling io_getevents, 
+epoll_wait or epoll_pwait will immediately pick up the next queued event and 
+continue execution, whereas previously waiting worker threads will continue to 
+be blocked. No context switches will occur, and the running thread will be 
+continually picking up new events, servicing them, then returning to pick up 
+new events again and so forth, without ideally ever giving up the CPU at the 
+event-fetching point, whereas blocked threads will remain stalled, but 
+available as standby if too many of active threads block in the event handlers. 
+Although cmgroup API defines no specific guarantees on matching threads to 
+events, it will generally make an effort to match FIFO queue of events to LIFO 
+queue of event-fetching threads, and to provide a streamlined non-stop event 
+fetching by the worker thread wherever possible.
+
+    [*] This behavior is implemented in the initial version of cmgroup code 
+        for epoll_wait and epoll_pwait, but not for io_getevents yet.
+
+When an AIO context or epoll fd associated with a concurrency management group 
+is destroyed, all threads blocked waiting on this AIO or epoll object are 
+released in the same way as for AIO context or epoll fd not associated with a 
+cmgroup, even if that causes the concurrency limit of the cmgroup to be 
+exceeded.
+
+
+TIMEOUT HANDLING
+================
+
+The timeout parameter for event-fetching operations (epoll_wait, epoll_pwait, 
+io_getevents) can specify a timeout value of zero, finite timeout or no timeout 
+(infinite timeout).
+
+Behavior of an event-fetching operation for the case of infinite timeout is as 
+described above.
+
+If the caller of an event-fetching operation specifies a timeout value of zero, 
+cmgroup concurrency constraint is not applied to the call. The calling thread 
+will still get associated with the cmgroup designated by the specified epoll fd 
+or AIO context, but the call will return immediately in non-blocking fashion, 
+overriding cmgroup constraint, even if that results in the count of runnable 
+threads in the cmgroup exceeding this cmgroup's concurrency limit.
+
+A finite timeout and concurrency management group are somewhat conflicting in 
+their purposes. The present API specification intentionally leaves behavior in 
+that case unspecified. As a matter of current implementation, timeout will be 
+honored and thread will be released, even if this results in the concurrency 
+limit for the group being exceeded. However this behavior may be subject to 
+change in the future.
+
+
+SIGNAL HANDLING
+===============
+
+If a thread blocked inside an event-fetching system call (io_getevents, 
+epoll_wait, epoll_pwait) receives a signal, and the event source (AIO context 
+or epoll fd specified in the call) is associated with cmgroup, the signal will 
+be handled the same way as for event sources not associated with a cmgroup: 
+i.e. if the signal is not masked, it will be honored, interrupt the system 
+call, and the thread will resume execution even if it means the number of 
+runnable threads in the cmgroup will exceed the concurrency value of the group.
+
+(If it is felt that in some cases this may lead to a thundering herd-like 
+problem, it may be possible to later introduce a flag-based option that will 
+make threads woken due to a signal to honor the concurrency value constraint 
+and stay blocked, but only for a limited time, let us say up to 1 second, and 
+resume either after the number of runnable threads in the cmgroup drops below 
+the concurrency value, or the mentioned timeout period expires.)
+
+
+CONCURRENCY VALUE
+=================
+
+Concurrency level is set by the application developer and, depending on the 
+application and its deployment environment, can set to be:
+
+    * equal to the number of CPUs in the system (if the system is chiefly 
+      dedicated to running this particular application and responses to requests 
+      are not meant to reflect interactive progress, such as response streaming);
+
+    * somewhat below the number of CPUs in the system (if the system is to be 
+      shared with other heavily-running applications);
+
+    * above the number of CPUs in the system (if the response to an event/request 
+      is intended to reflect interactive progress, such as response streaming, 
+      or if the transaction may require a lengthy computation; balance between 
+      interactive  response vs. throughput requirements can be dynamically
+      adjusted with cmgroup_set_concurrency_level(), depending on the current
+      system load).
+
+Note that deciding about the number of worker threads to be created by an 
+application is a completely separate issue from choosing proper concurrency 
+value. Typically, a worker thread pool would need to contain slightly more than 
+CV * (T-all / T-cpu) threads, where T-all is an average wall clock time a 
+worker thread spends processing a request, and T-cpu is an average CPU time a 
+worker thread spends processing a request (i.e. time spent by the thread in a 
+computational state). In practice T-all and T-cpu are likely to vary widely 
+depending on the kind of incoming requests, backend data, system load, backend 
+load and other similarly varying factors, therefore a typical approach is to 
+create an initial number of worker threads according to a guestimate, and then 
+create additional worker threads on demand. The latter can be implemented by 
+keeping a counter of worker threads currently waiting to fetch the request, 
+i.e. blocked inside syscalls such as io_getevents, epoll_wait and epoll_pwait. 
+Before calling an event-fetching routine, the worker thread increments the 
+counter in an atomic way (using an interlocked instruction or holding a lock 
+synchronizing access to the counter). After the event/request has been fetched 
+and before starting to process it, the worker thread atomically decrements the 
+counter. If the counter value at this point goes to zero, it means that there 
+remains no worker threads currently listening on the event source, the worker 
+thread pool had been depleted, and it is time to consider creating additional 
+worker threads.
+
+
+CONFIGURATION
+=============
+
+Concurrency management group facility is enabled with kernel configuration 
+option CMGROUPS (CONFIG_ CMGROUPS). If this option is not selected, 
+cmgroup-related syscalls will return error, in most cases ENOSYS.
+
+
+WHO CAN BENEFIT?
+================
+
+There are seven sources of inefficiency that concurrency management can help to 
+mitigate:
+
+1)  Inefficient use of limited resources, such as main memory or cache memory, 
+due to sub-optimal allocation because of too high a number of concurrently 
+running worker threads.
+
+2)  Losses due to high contention on a resource (e.g. synchronization on the 
+resource lock) because of too high a number of concurrent worker threads.
+
+3)  Overhead due to frequent rescheduling.
+4)  Overhead due to frequent task context switches.
+5)  Losses due to cache re-warming.
+6)  Losses due to TLB invalidation after a context switch.
+
+7) On NUMA machines, losses due to sub-optimal allocation of tasks to CPUs, 
+resulting in tasks executing on CPUs outside of the task's data preferred NUMA 
+memory zone.
+
+Losses 3-6 are incurred at the end of every scheduling time slice when a task 
+switch happens, however their magnitude is fairly small, of the order of tens 
+of microseconds of expended CPU time, which is tiny in comparison to a typical 
+time slice between task rescheduling points. 
+
+Under default values of Linux configuration parameters, the time slice for 
+CFS-managed tasks currently ranges from 3 ms (at two runnable tasks per CPU) to 
+0.75 ms (at 8 or more runnable tasks per CPU) on a single-CPU system. These 
+values are larger in a multiprocessor system with default minimum time slice 
+becoming approximately 1.8 ms on a typical 24 to 32-way server system, however 
+on a server installation the administrator may well increase the scheduling 
+time slice even further. Default time slice for SCHED_RR tasks is even higher: 
+100 ms.
+
+Losses due to factors 3-6 are but a small fraction of 1-2 ms time interval, 
+therefore they won't be significant for the worker threads with 2 ms or longer 
+duration per served request. Benefits of using cmgroup due to the factors 1-4 
+will be noticeable only for the applications with request handlers in the 
+sub-millisecond range per request, where the worker thread comes to fetch the 
+next request well before the thread's normal scheduling time slice expiration [*].
+
+    [*] And then chiefly if LIFO ordering of threads by event-fetching syscalls 
+        is implemented, allowing non-stop processing on the same worker thread 
+        with minimum frequency of task context switches, yielding a better
+        chance of using a "warm" thread. LIFO ordering is currently implemented
+        for epoll_wait and epoll_pwait, but not for io_getevents yet. 
+        Current (essentially pre-cmgroup in its core) implementation of
+        io_getevents does queue threads in LIFO order, but it uses non-exclusive
+        wait and wakes up all the waiting threads on every AIO event, resulting
+        in herd wakeup. This is yet to be fixed, both for cmgroup and non-cmgroup
+        cases.
+
+Improvements brought by the use of cmgroup due to factors 1-2 is more noticeable,
+but only in those applications that actually do suffer from extensive main memory
+use or cache memory use or high-contention locking by the worker threads, or
+other similar resource sharing issue.
+
+Thus, applications that can benefit from using cmgroup facility are 
+applications that process events or requests delivered via AIO or epoll 
+mechanism and fall into one of the following two patterns:
+
+a) Applications with event or request handler of any duration, but placing high 
+demand during request processing on resources such as memory or with worker 
+threads causing high contention on a resource or data lock, for data shared 
+between the worker threads. For those applications cmgroup can mitigate 
+inefficiency factors 1-2.
+
+b) Applications with very short event handlers, with execution time typically 
+in the sub-millisecond range. For these applications, cmgroup can mitigate 
+inefficiency factors 3-6. However losses due to factors 3-6 are small, 
+therefore recoverable losses in scenario (b) will be on the order of a fraction 
+of the percent of handler's run time, even for near-millisecond and 
+sub-millisecond handlers.
+
+Furthermore, in any of these cases for cmgroup to be useful, application's 
+request handler must be subject to blocking waits due to network or IO request, 
+waiting on a lock, page fault or other similar causes, with somewhat 
+varying/unpredictable duration or likelihood, otherwise simple statically fixed 
+"guesstimated" number of worker threads would work well enough.
+
+
+SIDE EFFECTS TO CONSIDER
+========================
+
+If a system is running multiple applications reducing the number of 
+application's worker threads can skew the load distribution between the 
+applications. For example, suppose the system was initially running 
+applications X and Y each utilizing 100 computable worker threads of identical 
+priority with both applications thus getting approximately 50% of the CPU 
+resources each. After reorganizing application X to use cmgroup and reducing 
+the number or X threads to let us say 10, there will be 10 threads in X and 
+still 100 threads in Y, therefore X threads will be now getting only 10 / (100 
++ 10) or roughly 9% of the CPU resources. If this is undesirable, higher share 
+of CPU resources for X can be restored by re-nicing X threads to a higher 
+priority level or by utilizing cgroups. 

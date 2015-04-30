@@ -1,0 +1,65 @@
+#!/bin/sh
+
+APP="./test2 -d 1800"
+
+#NC_M1="-m 1"
+#NC_U500="-u 500"
+
+NC_M1="-l 71000"
+NC_U500="-l 35500"
+
+TEST_AIO_M1="${APP} -e aio ${NC_M1}"
+TEST_EPOLL_M1="${APP} -e epoll ${NC_M1}"
+TEST_AIO_U500="${APP} -e aio ${NC_U500}"
+TEST_EPOLL_U500="${APP} -e epoll ${NC_U500}"
+
+set -x
+
+${TEST_AIO_M1} -t 24
+${TEST_AIO_M1} -t 50
+${TEST_AIO_M1} -t 100
+${TEST_AIO_M1} -t 200
+${TEST_AIO_M1} -t 1000
+
+${TEST_AIO_M1} -t 24 -c
+${TEST_AIO_M1} -t 50 -c
+${TEST_AIO_M1} -t 100 -c
+${TEST_AIO_M1} -t 200 -c 
+${TEST_AIO_M1} -t 1000 -c
+
+${TEST_AIO_U500} -t 24
+${TEST_AIO_U500} -t 50
+${TEST_AIO_U500} -t 100
+${TEST_AIO_U500} -t 200
+${TEST_AIO_U500} -t 1000
+
+${TEST_AIO_U500} -t 24 -c
+${TEST_AIO_U500} -t 50 -c
+${TEST_AIO_U500} -t 100 -c
+${TEST_AIO_U500} -t 200 -c 
+${TEST_AIO_U500} -t 1000 -c
+
+${TEST_EPOLL_M1} -t 24
+${TEST_EPOLL_M1} -t 50
+${TEST_EPOLL_M1} -t 100
+${TEST_EPOLL_M1} -t 200
+${TEST_EPOLL_M1} -t 1000
+
+${TEST_EPOLL_M1} -t 24 -c
+${TEST_EPOLL_M1} -t 50 -c
+${TEST_EPOLL_M1} -t 100 -c
+${TEST_EPOLL_M1} -t 200 -c 
+${TEST_EPOLL_M1} -t 1000 -c
+
+${TEST_EPOLL_U500} -t 24
+${TEST_EPOLL_U500} -t 50
+${TEST_EPOLL_U500} -t 100
+${TEST_EPOLL_U500} -t 200
+${TEST_EPOLL_U500} -t 1000
+
+${TEST_EPOLL_U500} -t 24 -c
+${TEST_EPOLL_U500} -t 50 -c
+${TEST_EPOLL_U500} -t 100 -c
+${TEST_EPOLL_U500} -t 200 -c 
+${TEST_EPOLL_U500} -t 1000 -c
+
